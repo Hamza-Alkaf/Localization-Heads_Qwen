@@ -12,7 +12,9 @@ def plot_heads_grid(attn: torch.Tensor, selected: List[Dict], meta: Dict, save_p
 
     attn: [L, H, 1, V]
     """
-    P = int(meta.get("patch_size"))
+    V = attn.shape[-1]
+    Ph = int(meta.get("patch_h", meta.get("patch_size", int(V ** 0.5))))
+    Pw = int(meta.get("patch_w", meta.get("patch_size", int(V ** 0.5))))
     W, H_img = meta["image_size"]
     n = len(selected)
     cols = n + 1
@@ -31,9 +33,16 @@ def plot_heads_grid(attn: torch.Tensor, selected: List[Dict], meta: Dict, save_p
     # Attention maps
     for i, hinfo in enumerate(selected):
         l, h = hinfo["layer"], hinfo["head"]
-        a2d = attn[l, h, 0].reshape(P, P).detach().cpu().numpy()
-        im = axes[i + 1].imshow(a2d, cmap="viridis")
-        axes[i + 1].set_title(f"L{l}-H{h}\nSE={hinfo['spatial_entropy']:.2f}")
+        a2d = attn[l, h, 0].reshape(Ph, Pw).detach().cpu().numpy()
+        im = axes[i + 1].imshow(a2d, cmap="viridis", aspect="auto")
+        title = f"L{l}-H{h}"
+        if "AUROC" in hinfo:
+            title += f"\nAUROC={hinfo['AUROC']:.3f}"
+        if "IoU" in hinfo:
+            title += f"\nIoU={hinfo['IoU']:.3f}"
+        if "spatial_entropy" in hinfo:
+            title += f"\nSE={hinfo['spatial_entropy']:.3f}"
+        axes[i + 1].set_title(title)
         axes[i + 1].axis("off")
         plt.colorbar(im, ax=axes[i + 1], fraction=0.046, pad=0.04)
 

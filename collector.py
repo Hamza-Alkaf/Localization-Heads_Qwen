@@ -71,6 +71,7 @@ def load_model_from_cfg(cfg) -> Tuple[object, object, object, int, str]:
         model_name=model_name_str,
         device=device,
         use_flash_attn=getattr(cfg.model, "use_flash_attn", False),
+        
     )
     return tok, model, img_proc, context_len, model_name_str
 
@@ -107,10 +108,20 @@ def _forward_collect(model, tokenizer, image_processor, input_ids, image_tensor,
 def _generate_collect(model, tokenizer, image_processor, input_ids, image_tensor, image_sizes, max_new_tokens=10, do_sample=False, num_beams=1):
     """Run generate to obtain output tokens, and try to collect attentions from the first generation step.
 
+    Returns None to signal the caller to fall back to _forward_collect when:
+      - generate() does not expose attentions (flash-attn backend)
+      - the visual-token slice is out-of-range (src too short)
+      - the returned attention over visual tokens is degenerate (all zeros)
+
     Returns: (attn [L,H,1,V] or None, generated_text str)
     """
+    # attention_mask is required for correct KV-cache bookkeeping.
+    # Without it the model may produce garbage / all-zero attention weights.
+    attention_mask = torch.ones_like(input_ids)
+
     gen = model.generate(
         inputs=input_ids,
+        attention_mask=attention_mask,
         images=image_tensor.unsqueeze(0),
         image_sizes=image_sizes,
         do_sample=do_sample,
@@ -126,19 +137,92 @@ def _generate_collect(model, tokenizer, image_processor, input_ids, image_tensor
 
     attn_last_to_vis = None
     if hasattr(gen, 'attentions') and gen.attentions:
-        step0 = gen.attentions[0]  # tuple length L, each [B,H,1,src]
-        layers = [t[0] for t in step0]  # list of [H,1,src]
-        attn = torch.stack(layers, dim=0)  # [L,H,1,src]
+        # ----------------------------------------------------------------
+        # In modern HF transformers (>=4.40), gen.attentions[0] is often
+        # the PREFILL step with shape [B, H, T_input, T_input], NOT the
+        # first generated token.  The first true decode step has Tq==1.
+        #
+        # Strategy: iterate through all steps and find the first one where
+        # every valid layer has Tq==1.  Fall back to the last row of the
+        # first available step if no Tq==1 step exists.
+        # ----------------------------------------------------------------
+
         begin_pos_vis = MetadataStation.get_begin_pos('vis')
         vis_len = MetadataStation.get_vis_len()
         if begin_pos_vis is None or vis_len is None:
             raise RuntimeError("Missing visual token segmentation info.")
-        attn_last_to_vis = attn[:, :, :, begin_pos_vis:begin_pos_vis + vis_len]
+
+        # Diagnostic: print step count and shapes of first two steps
+        num_steps = len(gen.attentions)
+        _shapes = []
+        for _i, _step in enumerate(gen.attentions[:3]):
+            _vl = [t for t in _step if t is not None]
+            if _vl:
+                _shapes.append(f"step{_i}: [L={len(_vl)}, H={_vl[0][0].shape[0]}, "
+                               f"Tq={_vl[0][0].shape[1]}, Tk={_vl[0][0].shape[2]}]")
+        print(f"[DEBUG] _generate_collect: gen.attentions has {num_steps} step(s). "
+              f"First steps shapes: {_shapes}")
+
+        # Find the first step whose Tq == 1  (= first decoded token's attention)
+        decode_step_attn = None
+        prefill_step_attn = None  # fallback: last row of prefill
+        for _step in gen.attentions:
+            valid_layers = [t for t in _step if t is not None]
+            if not valid_layers:
+                continue
+            _stacked = torch.stack([t[0] for t in valid_layers], dim=0)  # [L, H, Tq, Tk]
+            if prefill_step_attn is None:
+                prefill_step_attn = _stacked  # keep first non-None step as prefill fallback
+            if _stacked.shape[-2] == 1:        # Tq==1 → true decode step
+                decode_step_attn = _stacked
+                print(f"[INFO] _generate_collect: using decode-step attention "
+                      f"(Tq=1, Tk={_stacked.shape[-1]})")
+                break
+
+        if decode_step_attn is None:
+            # No Tq==1 step found: transformers exposed only the prefill.
+            # Use the last row (last prompt position) of the prefill — semantically
+            # equivalent to forward-pass mode; we warn the caller.
+            decode_step_attn = prefill_step_attn
+            if decode_step_attn is not None:
+                print(
+                    f"[WARNING] _generate_collect: no Tq==1 decode step found in "
+                    f"gen.attentions ({num_steps} steps). Using last row of prefill step "
+                    "(equivalent to forward-pass mode)."
+                )
+
+        if decode_step_attn is not None:
+            src = decode_step_attn.shape[-1]  # Tk = full context length
+
+            # Guard: visual-token slice must fit within Tk
+            if vis_len > 0 and (begin_pos_vis + vis_len) <= src:
+                # -1 on Tq axis: works for decode (Tq=1) and prefill (Tq=T, last row)
+                candidate = decode_step_attn[:, :, -1:, begin_pos_vis:begin_pos_vis + vis_len]
+
+                # Guard: degenerate all-zero result → fall back to forward pass
+                if candidate.sum().item() == 0.0:
+                    print(
+                        "[WARNING] _generate_collect: visual attention slice is all-zero "
+                        f"(src={src}, begin_pos_vis={begin_pos_vis}, vis_len={vis_len}). "
+                        "Falling back to forward-pass attention."
+                    )
+                else:
+                    attn_last_to_vis = candidate
+            else:
+                print(
+                    f"[WARNING] _generate_collect: src={src} is smaller than "
+                    f"begin_pos_vis({begin_pos_vis})+vis_len({vis_len}). "
+                    "Falling back to forward-pass attention."
+                )
+
     return attn_last_to_vis, generated_text
 
 
 def collect_attention(cfg, image_file: str, query: str, save_dir: str, save_id: str) -> str:
     """Run one forward pass and save attention focused on image tokens.
+
+    Dispatches to backend-specific collector based on cfg.model.backend.
+    Supported backends: 'llava' (default), 'qwen_vl'.
 
     Saves a pickle with dict: {
       'attn': Tensor[L, H, 1, V],
@@ -146,6 +230,12 @@ def collect_attention(cfg, image_file: str, query: str, save_dir: str, save_id: 
     }
     Returns the saved file path.
     """
+    backend = getattr(cfg.model, "backend", "llava")
+    if backend == "qwen_vl":
+        from collector_qwen import collect_attention_qwen
+        return collect_attention_qwen(cfg, image_file, query, save_dir, save_id)
+
+    # --- LLaVA backend (original code below) ---
     tokenizer, model, image_processor, _, model_name_str = load_model_from_cfg(cfg)
 
     # Prepare image

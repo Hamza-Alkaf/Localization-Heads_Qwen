@@ -1,0 +1,23 @@
+# Model configuration for Qwen3-VL (Hugging Face path)
+name: Qwen/Qwen3-VL-2B-Instruct
+base: null
+cache_dir: null
+
+# Backend selector: "llava" | "qwen_vl"
+backend: qwen_vl
+
+# Generation settings (keep small; we only need few tokens for attention)
+max_new_tokens: 10
+do_sample: false
+num_beams: 1
+
+# Attention collection behavior
+use_generate: True  # if true, run generate (saves output tokens); else use forward
+use_flash_attn: false  # set true only if flash-attn is installed
+load_4bit: True       # set true to load in NF4 (requires bitsandbytes)
+
+# Qwen3-VL specific: pixel budget fed to the vision encoder.
+# Larger values = more visual tokens (finer attention grid) but more VRAM.
+# Values are multiplied by 28*28 internally by the processor.
+min_pixels: 256
+max_pixels: 1024

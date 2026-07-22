@@ -9,19 +9,20 @@ from scipy.ndimage import gaussian_filter
 import torch.nn.functional as F
 
 
-def combine_heads(attn: torch.Tensor, selected: List[Dict], P: int, sigma: float) -> np.ndarray:
+def combine_heads(attn: torch.Tensor, selected: List[Dict], Ph: int, Pw: int, sigma: float) -> np.ndarray:
     """Combine selected heads with optional Gaussian smoothing.
 
     attn: [L, H, 1, V]
-    Returns: combined 2D map [P, P] as numpy float32
+    Returns: combined 2D map [Ph, Pw] as numpy float32
     """
-    M = np.zeros((P, P), dtype=np.float32)
+    M = np.zeros((Ph, Pw), dtype=np.float32)
+    
     for item in selected:
         l, h = item["layer"], item["head"]
-        a2d = attn[l, h, 0].reshape(P, P).detach().cpu().to(torch.float32).numpy()
+        a2d = attn[l, h, 0].reshape(Ph, Pw).detach().cpu().to(torch.float32).numpy()
         if sigma and sigma > 0:
             a2d = gaussian_filter(a2d, sigma=sigma)
-        M += a2d.astype(np.float32)
+        M+= a2d.astype(np.float32) #/ len(selected)
     return M
 
 
@@ -49,10 +50,10 @@ def upscale_mask(mask: np.ndarray, image_size: Tuple[int, int]) -> np.ndarray:
     return (t_up.detach().cpu().numpy() > 0.5).astype(np.uint8)
 
 
-def scale_bbox_to_image(bbox_grid: Tuple[int, int, int, int], image_size: Tuple[int, int], P: int) -> Tuple[int, int, int, int]:
+def scale_bbox_to_image(bbox_grid: Tuple[int, int, int, int], image_size: Tuple[int, int], Ph: int, Pw: int) -> Tuple[int, int, int, int]:
     x0, y0, x1, y1 = bbox_grid
     W, H = image_size
-    sx, sy = W / P, H / P
+    sx, sy = W / Pw, H / Ph   # x-axis scales with Pw (columns), y-axis with Ph (rows)
     # Convert grid box (inclusive) to pixel box (inclusive)
     px0 = int(x0 * sx)
     py0 = int(y0 * sy)

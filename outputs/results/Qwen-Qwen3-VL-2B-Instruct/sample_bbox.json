@@ -1,0 +1,39 @@
+{
+  "bbox_xyxy": [
+    0,
+    0,
+    274,
+    182
+  ],
+  "image_size": [
+    275,
+    183
+  ],
+  "selected_heads": [
+    {
+      "layer": 14,
+      "head": 14,
+      "spatial_entropy": 1.4310132265090942
+    },
+    {
+      "layer": 16,
+      "head": 14,
+      "spatial_entropy": Infinity
+    },
+    {
+      "layer": 19,
+      "head": 5,
+      "spatial_entropy": 0.42529940605163574
+    },
+    {
+      "layer": 19,
+      "head": 9,
+      "spatial_entropy": Infinity
+    },
+    {
+      "layer": 20,
+      "head": 14,
+      "spatial_entropy": Infinity
+    }
+  ]
+}

@@ -42,12 +42,13 @@ def run_single(cfg: DictConfig) -> Dict:
 
     # id for saving
     save_id = cfg.data.get("save_id", "sample")
-
+    query = """Directly answer the question based on the image, no explanation is needed.\n    If the image does not contain any relevant evidence, 
+    output "I cannot answer based on the given image. \n""" + cfg.data.query
     # Stage: collect
     attn_file = collect_attention(
         cfg=cfg,
         image_file=cfg.data.image_file,
-        query=cfg.data.query,
+        query=query,
         save_dir=_out_root(cfg),
         save_id=save_id,
     )
@@ -55,6 +56,7 @@ def run_single(cfg: DictConfig) -> Dict:
     # Stage: analyze
     attn, meta = load_attention_file(attn_file)
     selected = analyze_heads(cfg, attn, meta)
+    
 
     # Save analysis
     with open(attn_file.replace('.pkl', '_analysis.pkl'), 'wb') as f:
@@ -65,13 +67,15 @@ def run_single(cfg: DictConfig) -> Dict:
         fig_path = os.path.join(attn_root, f"{save_id}_top{cfg.logic.top_k}.png")
         plot_heads_grid(attn, selected[: cfg.logic.top_k], meta, fig_path, show_plot=cfg.show_plot)
 
-    # Combine to bbox/mask
-    P = int(meta["patch_size"])  # grid size
-    combo = combine_heads(attn, selected[: cfg.logic.top_k], P=P, sigma=cfg.logic.smoothing.sigma)
+    # Combine to bbox/mask  (Ph/Pw support non-square grids, e.g. Qwen3-VL)
+    V = attn.shape[-1]
+    Ph = int(meta.get("patch_h", meta.get("patch_size", int(V ** 0.5))))
+    Pw = int(meta.get("patch_w", meta.get("patch_size", int(V ** 0.5))))
+    combo = combine_heads(attn, selected[: cfg.logic.top_k], Ph=Ph, Pw=Pw, sigma=cfg.logic.smoothing.sigma)
     mask_grid = binarize_mean_relu(combo)
     bbox_grid = bbox_from_mask(mask_grid)
     mask_img = upscale_mask(mask_grid, meta["image_size"])  # [H,W] uint8
-    bbox_img = scale_bbox_to_image(bbox_grid, meta["image_size"], P)
+    bbox_img = scale_bbox_to_image(bbox_grid, meta["image_size"], Ph=Ph, Pw=Pw)
 
     # Save bbox/mask
     mask_path = os.path.join(attn_root, f"{save_id}_mask.png")
@@ -94,12 +98,14 @@ def run_analyze_visualize(cfg: DictConfig) -> None:
         fig_path = cfg.data.attention_file.replace('.pkl', f'_top{cfg.logic.top_k}.png')
         plot_heads_grid(attn, selected[: cfg.logic.top_k], meta, fig_path, cfg.show_plot)
     # Optionally bbox/mask
-    P = int(meta.get("patch_size", int((attn.shape[-1]) ** 0.5)))
-    combo = combine_heads(attn, selected[: cfg.logic.top_k], P=P, sigma=cfg.logic.smoothing.sigma)
+    V = attn.shape[-1]
+    Ph = int(meta.get("patch_h", meta.get("patch_size", int(V ** 0.5))))
+    Pw = int(meta.get("patch_w", meta.get("patch_size", int(V ** 0.5))))
+    combo = combine_heads(attn, selected[: cfg.logic.top_k], Ph=Ph, Pw=Pw, sigma=cfg.logic.smoothing.sigma)
     mask_grid = binarize_mean_relu(combo)
     bbox_grid = bbox_from_mask(mask_grid)
     mask_img = upscale_mask(mask_grid, meta["image_size"])  # [H,W]
-    bbox_img = scale_bbox_to_image(bbox_grid, meta["image_size"], P)
+    bbox_img = scale_bbox_to_image(bbox_grid, meta["image_size"], Ph=Ph, Pw=Pw)
     save_mask_png(cfg.data.attention_file.replace('.pkl', '_mask.png'), mask_img)
     save_bbox_json(cfg.data.attention_file.replace('.pkl', '_bbox.json'), bbox_img, meta["image_size"], selected[: cfg.logic.top_k])
 
@@ -136,12 +142,14 @@ def run_batch(cfg: DictConfig) -> None:
         if cfg.save_fig and cfg.data.visualize_batch:
             fig_path = os.path.join(attn_root, f"{sid}_top{cfg.logic.top_k}.png")
             plot_heads_grid(attn, selected[: cfg.logic.top_k], meta, fig_path, show_plot=cfg.show_plot)
-        P = int(meta["patch_size"])  # grid size
-        combo = combine_heads(attn, selected[: cfg.logic.top_k], P=P, sigma=cfg.logic.smoothing.sigma)
+        V = attn.shape[-1]
+        Ph = int(meta.get("patch_h", meta.get("patch_size", int(V ** 0.5))))
+        Pw = int(meta.get("patch_w", meta.get("patch_size", int(V ** 0.5))))
+        combo = combine_heads(attn, selected[: cfg.logic.top_k], Ph=Ph, Pw=Pw, sigma=cfg.logic.smoothing.sigma)
         mask_grid = binarize_mean_relu(combo)
         bbox_grid = bbox_from_mask(mask_grid)
         mask_img = upscale_mask(mask_grid, meta["image_size"])  # [H,W]
-        bbox_img = scale_bbox_to_image(bbox_grid, meta["image_size"], P)
+        bbox_img = scale_bbox_to_image(bbox_grid, meta["image_size"], Ph=Ph, Pw=Pw)
         mask_path = os.path.join(attn_root, f"{sid}_mask.png")
         bbox_path = os.path.join(attn_root, f"{sid}_bbox.json")
         save_mask_png(mask_path, mask_img)

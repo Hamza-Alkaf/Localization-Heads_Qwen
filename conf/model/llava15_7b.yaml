@@ -3,7 +3,7 @@ name: liuhaotian/llava-v1.5-7b
 base: null
 cache_dir: null
 # vision_tower_cache_dir: null
-
+backend: llava
 # Conversation template for prompt formatting
 conv_mode: referseg
 
@@ -15,3 +15,5 @@ num_beams: 1
 # Attention collection behavior
 use_generate: false  # if true, run generate (save output tokens); else use forward
 use_flash_attn: false  # always keep false
+load_4bit: True       # set true to load in NF4 (requires bitsandbytes)
+
