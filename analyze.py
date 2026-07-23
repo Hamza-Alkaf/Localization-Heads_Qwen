@@ -5,7 +5,14 @@ from sklearn.metrics import roc_auc_score
 import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
+from pycocotools import mask as coco_mask_utils
+import torch.nn.functional as F
 
+def polygon_to_mask(segmentation, height, width):
+    """Convert COCO polygon segmentation to a binary mask (H x W bool array)."""
+    rles = coco_mask_utils.frPyObjects(segmentation, height, width)
+    rle  = coco_mask_utils.merge(rles)
+    return coco_mask_utils.decode(rle).astype(bool)
 
 def bboxes_to_mask(bboxes, h, w):
     """Return a boolean (H, W) mask; True where any bbox covers the pixel.
@@ -111,14 +118,14 @@ def elbow_chord(values: List[float]) -> float:
     return float(y[elbow_i])
 
 
-def analyze_heads(cfg, attn: torch.Tensor, meta: Dict, bbox: Optional[List] = None) -> List[Dict]:
+def analyze_heads(cfg, attn: torch.Tensor, meta: Dict, bbox_mask: Optional[List] = None) -> List[Dict]:
     """Analyze heads and return a ranked list.
 
     attn : [L, H, 1, V]
     meta : includes patch_h, patch_w (or patch_size for square-grid models)
            and image_size (W, H) in pixels.
-    bbox : optional list of [x1, y1, x2, y2] boxes in **image pixel** coordinates.
-           When provided, AUROC and IoU are computed for each head.
+    bbox_mask : optional list of [x1, y1, x2, y2] boxes in **image pixel** coordinates.
+           When provided, AUROC and IoU are computed for each head or a mask.
     """
     L, H, _, V = attn.shape
     # Support non-square grids (e.g. Qwen3-VL): use patch_h/patch_w when available
@@ -131,6 +138,8 @@ def analyze_heads(cfg, attn: torch.Tensor, meta: Dict, bbox: Optional[List] = No
         for h in range(H):
             s = float(attn[l, h, 0].sum().item())
             sums.append(s)
+    
+        
 
     thr_val = elbow_chord(sums) if cfg.logic.threshold.method == "chord" else min(sums)
 
@@ -138,28 +147,32 @@ def analyze_heads(cfg, attn: torch.Tensor, meta: Dict, bbox: Optional[List] = No
     # BUG FIX: bboxes come in image-pixel coordinates; we must scale them to the
     # patch grid (Ph x Pw) before passing to bboxes_to_mask, otherwise all
     # coordinates are out-of-bounds and the mask stays all zeros.
-    have_gt = bbox is not None and len(bbox) > 0
-    if have_gt:
-        image_size = meta.get("image_size")  # (W, H) in pixels
-        if image_size is not None:
-            img_w, img_h = int(image_size[0]), int(image_size[1])
-        else:
-            # Fallback: assume bboxes are already in grid space
-            img_w, img_h = Pw, Ph
+    
+    image_size = meta.get("image_size")  # (W, H) in pixels
+    if image_size is not None:
+        img_w, img_h = int(image_size[0]), int(image_size[1])
+    else:
+        # Fallback: assume bboxes are already in grid space
+        img_w, img_h = Pw, Ph
+    
+    if len(bbox_mask[0]) == 4:
+        bbox = bbox_mask
         grid_bboxes = scale_bboxes_to_grid(bbox, img_w, img_h, Pw, Ph)
         gt_mask = bboxes_to_mask(grid_bboxes, Ph, Pw)
-        flattened_gt_mask = gt_mask.flatten()
-        print(
-            f"GT mask: {int(flattened_gt_mask.sum())} positive patches "
-            f"out of {len(flattened_gt_mask)}  "
-            f"(grid {Ph}h x {Pw}w, image {img_h}x{img_w}px)"
-        )
-        # AUROC requires both classes to be present
-        gt_has_both_classes = flattened_gt_mask.sum() > 0 and (~flattened_gt_mask).sum() > 0
     else:
-        gt_mask = None
-        flattened_gt_mask = None
-        gt_has_both_classes = False
+        gt_mask = polygon_to_mask(bbox_mask, img_h, img_w)
+        
+    print(gt_mask.shape)
+    flattened_gt_mask = gt_mask.flatten()
+    print(flattened_gt_mask.shape)
+    print(
+        f"GT mask: {int(flattened_gt_mask.sum())} positive patches "
+        f"out of {len(flattened_gt_mask)}  "
+        f"(grid {Ph}h x {Pw}w, image {img_h}x{img_w}px)"
+    )
+    # AUROC requires both classes to be present
+    gt_has_both_classes = flattened_gt_mask.sum() > 0 and (~flattened_gt_mask).sum() > 0
+    
 
     # ---- Per-head analysis ---------------------------------------------------
     results: List[Dict] = []
@@ -175,16 +188,26 @@ def analyze_heads(cfg, attn: torch.Tensor, meta: Dict, bbox: Optional[List] = No
             #     continue
             s = sums[idx]
             idx += 1
+            a2d     = attn[l, h, 0].reshape(Ph, Pw)
+            if len(bbox_mask[0]) != 4:
+                a2d = F.interpolate(
+                    a2d.unsqueeze(0).unsqueeze(0),      # (1,1,Ph,Pw)
+                    size=(img_h, img_w),
+                    mode='bilinear',
+                    align_corners=False 
+                ).squeeze()  
+            
+            a2d_np  = a2d.detach().cpu().to(torch.float32).numpy()
+            auroc = float(roc_auc_score(flattened_gt_mask, a2d_np.flatten()))
+            mean_val     = a2d_np.mean()
+            pred_binary  = (np.maximum(a2d_np - mean_val * 2, 0) > cfg.logic.entropy.binarize_threshold)
+            iou   = compute_iou(pred_binary, gt_mask)
+
             if s < thr_val:
                 se = float("inf")
                 bottom_row_focus = False
                 n_comp = 0
-                a2d     = attn[l, h, 0].reshape(Ph, Pw)
-                a2d_np  = a2d.detach().cpu().to(torch.float32).numpy()
-                auroc = float(roc_auc_score(flattened_gt_mask, a2d_np.flatten()))
-                mean_val     = a2d_np.mean()
-                pred_binary  = (np.maximum(a2d_np - mean_val * 2, 0) > cfg.logic.entropy.binarize_threshold)
-                iou   = compute_iou(pred_binary, gt_mask)
+                
             else:
                 a2d     = attn[l, h, 0].reshape(Ph, Pw)
                 a2d_np  = a2d.detach().cpu().to(torch.float32).numpy()
@@ -194,16 +217,14 @@ def analyze_heads(cfg, attn: torch.Tensor, meta: Dict, bbox: Optional[List] = No
                 se      = float(se_res["spatial_entropy"])   # lower is better
                 n_comp  = int(se_res["num_components"])
 
-                if have_gt and gt_has_both_classes:
-                    auroc = float(roc_auc_score(flattened_gt_mask, a2d_np.flatten()))
-                    # IoU: binarize attention map the same way as spatial_entropy does
-                    mean_val     = a2d_np.mean()
-                    pred_binary  = (np.maximum(a2d_np - mean_val * 2, 0) > cfg.logic.entropy.binarize_threshold)
-                    iou          = compute_iou(pred_binary, gt_mask)
-                else:
-                    auroc = 0.0
-                    iou   = 0.0
-
+            # import matplotlib.pyplot as plt
+            # plt.subplot(1,2,1)
+            # plt.imshow(gt_mask)
+            # plt.title("GT Mask")
+            # plt.subplot(1,2,2)
+            # plt.imshow(pred_binary)
+            # plt.title(f"AUROC: {auroc:.3f} IoU: {iou:.3f}")
+            # plt.show()
             results.append({
                 "layer":           l,
                 "head":            h,
@@ -230,9 +251,9 @@ def analyze_heads(cfg, attn: torch.Tensor, meta: Dict, bbox: Optional[List] = No
         by_sum = sorted(results, key=lambda x: x["attn_sum"], reverse=True)
         kept = [x for x in by_sum if not x["bottom_row_focus"]][: cfg.logic.threshold.min_keep]
 
-    if have_gt and gt_has_both_classes:
+    if gt_has_both_classes:
         # Sort by AUROC descending (best localisation head first)
-        kept = sorted(kept, key=lambda x: x["IoU"], reverse=True)
+        kept = sorted(kept, key=lambda x: x["AUROC"], reverse=True)
     else:
         # Fall back to spatial entropy ascending (most focused head first)
         kept = sorted(kept, key=lambda x: x["spatial_entropy"])

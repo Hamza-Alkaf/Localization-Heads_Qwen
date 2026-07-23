@@ -75,7 +75,7 @@ class _NS:
 
 
 def _build_cfg(args: argparse.Namespace) -> _NS:
-    """Construct the config namespace expected by the collectors / analyze / bbox."""
+    """Construct the config namespace expected by the collectors / analyze / bbox_mask."""
     backend = args.backend  # "qwen_vl" | "llava"
 
     if backend == "qwen_vl":
@@ -432,7 +432,7 @@ def _run_sample_llava(cfg, model, image_processor, tokenizer, image_file: str, q
 # Shared post-processing & save
 # ---------------------------------------------------------------------------
 
-def _run_sample(cfg, model, aux1, aux2, image_file: str, query: str, save_id: str, out_dir: str, bbox: List[int] = None) -> Dict:
+def _run_sample(cfg, model, aux1, aux2, image_file: str, query: str, save_id: str, out_dir: str, bbox_mask: List[int] = None) -> Dict:
     """
     Dispatch to the correct backend, run analysis, and save all four outputs.
     """
@@ -449,7 +449,7 @@ def _run_sample(cfg, model, aux1, aux2, image_file: str, query: str, save_id: st
         attn_cpu, meta = _run_sample_llava(cfg, model, aux1, aux2, image_file, query)
 
     # ---- Head analysis ----
-    selected = analyze_heads(cfg, attn_cpu, meta, bbox=bbox)  # List[Dict] with layer, head, attn_sum, spatial_entropy, bottom_row_focus, num_components
+    selected = analyze_heads(cfg, attn_cpu, meta, bbox_mask=bbox_mask)  # List[Dict] with layer, head, attn_sum, spatial_entropy, bottom_row_focus, num_components
  
 
     # ---- Mask ----
@@ -531,9 +531,9 @@ def parse_args() -> argparse.Namespace:
         description="Run LocalizationHeads pipeline on all TextVQA samples."
     )
     # Data
-    p.add_argument("--jsonl",    default="textvqa_1000_samples.jsonl",
+    p.add_argument("--jsonl",    default="refcoco_samples/metadata.jsonl",
                    help="Path to the JSONL file")
-    p.add_argument("--output",   default="textvqa_results",
+    p.add_argument("--output",   default="refcoco_results",
                    help="Root output directory")
     p.add_argument("--start",    type=int, default=0,
                    help="First sample index (inclusive)")
@@ -573,7 +573,12 @@ def main():
     script_dir = Path(__file__).parent.resolve()
     jsonl_path = Path(args.jsonl) if Path(args.jsonl).is_absolute() else script_dir / args.jsonl
     out_root   = Path(args.output) if Path(args.output).is_absolute() else script_dir / args.output
-
+    dataset = ""
+    if "metadata" in args.jsonl:
+        dataset = "refcoco"
+    else:
+        dataset = "textvqa"
+    
     if not jsonl_path.exists():
         log.error(f"JSONL file not found: {jsonl_path}")
         sys.exit(1)
@@ -593,21 +598,27 @@ def main():
 
     # Load model once
     model, aux1, aux2, _ = _load_model(cfg)
-
-    template = (
-        "Directly answer the question based on the image, no explanation is needed.\n"
-        "If the image does not contain any relevant evidence, "
-        "output \"I cannot answer based on the given image.\"\n"
-    )
+    if dataset == "refcoco":
+        template = "Segment the object described below, the first token that you generate should match the object:\n"
+        
+    elif dataset == "textvqa":
+        template = """Directly answer the question based on the image, no explanation is needed.\n"
+            "If the image does not contain any relevant evidence, "
+            "output \"I cannot answer based on the given image.\"\n"""
+    
     failed = 0
     success = 0
     skipped = 0
 
     for i, sample in enumerate(work, start=start):
         image_id   = sample.get("image_id", f"item_{i}")
-        question   = sample.get("question", "")
         image_file = sample.get("image_file", "")
-        bbox = sample.get("bboxs", None)  # Optional ground truth bbox for IoU calculation
+        if dataset == "textvqa":
+            question   = sample.get("question", "")
+            bbox_mask = sample.get("bboxs", None)  # Optional ground truth bbox_mask for IoU calculation
+        elif dataset == "refcoco":
+            question = sample.get("sentences", "")[0].get("raw")
+            bbox_mask = sample.get("segmentation", None)  # Optional ground truth bbox_mask for IoU calculation
 
         if image_file and not Path(image_file).is_absolute():
             image_file = str(script_dir / image_file)
@@ -635,7 +646,7 @@ def main():
                 query      = template + question,
                 save_id    = image_id,
                 out_dir    = sample_out_dir,
-                bbox       = bbox,  # Optional ground truth bbox for IoU calculation
+                bbox_mask       = bbox_mask,  # Optional ground truth bbox_mask for IoU calculation
             )
             log.info(f"  ✓ selected_heads → {paths['selected_heads']}")
             log.info(f"    mask           → {paths['mask']}")
